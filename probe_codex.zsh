@@ -24,6 +24,10 @@ NOTIFY_ALERT_SECONDS="${ANYROUTER_NOTIFY_ALERT_SECONDS:-8}"
 NOTIFY_DIALOG_SECONDS="${ANYROUTER_NOTIFY_DIALOG_SECONDS:-0}"
 NOTIFY_GROUP="${ANYROUTER_NOTIFY_GROUP:-anyrouter-api-probe}"
 NOTIFY_IGNORE_DND="${ANYROUTER_NOTIFY_IGNORE_DND:-1}"
+DIALOG_LABEL="${ANYROUTER_DIALOG_LABEL:-com.yang.anyrouter-probe.dialog}"
+DIALOG_PLIST="$HOME/Library/LaunchAgents/$DIALOG_LABEL.plist"
+DIALOG_STATE_FILE="${ANYROUTER_DIALOG_STATE_FILE:-$LOG_DIR/dialog.state}"
+DIALOG_DEDUP="${ANYROUTER_DIALOG_DEDUP:-1}"
 CODEX_BIN="${ANYROUTER_CODEX_BIN:-}"
 REASONING_EFFORT="${ANYROUTER_CODEX_REASONING_EFFORT:-low}"
 ALL_ACCOUNTS="${ANYROUTER_CODEX_ALL_ACCOUNTS:-0}"
@@ -192,8 +196,128 @@ format_epoch() {
 
 self_stop_agent() {
   [[ "$(uname -s)" == "Darwin" ]] || return 0
-  launchctl bootout "gui/$UID" "$PLIST" >/dev/null 2>&1 || true
   rm -f "$PLIST"
+  launchctl bootout "gui/$UID/$LABEL" >/dev/null 2>&1 || true
+}
+
+schedule_self_stop_agent() {
+  [[ "$(uname -s)" == "Darwin" ]] || return 0
+
+  local cleanup_label cleanup_plist stopper_log escaped_cleanup_label escaped_cleanup_plist escaped_label escaped_plist
+  local escaped_delay escaped_stopper_log
+  cleanup_label="$LABEL.stopper"
+  cleanup_plist="$HOME/Library/LaunchAgents/$cleanup_label.plist"
+  stopper_log="$LOG_DIR/$LABEL.stopper.log"
+  escaped_cleanup_label="$(xml_escape "$cleanup_label")"
+  escaped_cleanup_plist="$(xml_escape "$cleanup_plist")"
+  escaped_label="$(xml_escape "$LABEL")"
+  escaped_plist="$(xml_escape "$PLIST")"
+  escaped_delay="$(xml_escape "${ANYROUTER_STOP_DELAY_SECONDS:-0}")"
+  escaped_stopper_log="$(xml_escape "$stopper_log")"
+
+  mkdir -p "$HOME/Library/LaunchAgents"
+  launchctl bootout "gui/$UID/$cleanup_label" >/dev/null 2>&1 || true
+
+  {
+    print -r -- '<?xml version="1.0" encoding="UTF-8"?>'
+    print -r -- '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    print -r -- '<plist version="1.0">'
+    print -r -- '<dict>'
+    print -r -- '  <key>Label</key>'
+    print -r -- "  <string>$escaped_cleanup_label</string>"
+    print -r -- '  <key>ProgramArguments</key>'
+    print -r -- '  <array>'
+    print -r -- '    <string>/bin/zsh</string>'
+    print -r -- '    <string>-c</string>'
+    print -r -- '    <string>delay="$1"; uid="$2"; target_label="$3"; target_plist="$4"; cleanup_label="$5"; cleanup_plist="$6"; stopper_log="$7"; mkdir -p "$(dirname "$stopper_log")" 2&gt;/dev/null || true; print -r -- "start	$(date &apos;+%Y-%m-%d %H:%M:%S %z&apos;)	target=$target_label	plist=$target_plist" &gt;&gt; "$stopper_log"; sleep "$delay"; launchctl bootout "gui/$uid" "$target_plist" &gt;&gt; "$stopper_log" 2&gt;&gt; "$stopper_log"; rc1=$?; if [[ "$rc1" != "0" ]]; then launchctl bootout "gui/$uid/$target_label" &gt;&gt; "$stopper_log" 2&gt;&gt; "$stopper_log"; rc2=$?; else rc2=0; fi; rm -f "$target_plist"; if [[ -f "$target_plist" ]]; then exists=yes; else exists=no; fi; print -r -- "done	$(date &apos;+%Y-%m-%d %H:%M:%S %z&apos;)	rc1=$rc1	rc2=$rc2	plist_exists=$exists" &gt;&gt; "$stopper_log"; rm -f "$cleanup_plist"; launchctl bootout "gui/$uid/$cleanup_label" &gt;/dev/null 2&gt;/dev/null || true</string>'
+    print -r -- '    <string>_</string>'
+    print -r -- "    <string>$escaped_delay</string>"
+    print -r -- "    <string>$UID</string>"
+    print -r -- "    <string>$escaped_label</string>"
+    print -r -- "    <string>$escaped_plist</string>"
+    print -r -- "    <string>$escaped_cleanup_label</string>"
+    print -r -- "    <string>$escaped_cleanup_plist</string>"
+    print -r -- "    <string>$escaped_stopper_log</string>"
+    print -r -- '  </array>'
+    print -r -- '  <key>RunAtLoad</key>'
+    print -r -- '  <true/>'
+    print -r -- '</dict>'
+    print -r -- '</plist>'
+  } > "$cleanup_plist"
+  chmod 644 "$cleanup_plist"
+
+  launchctl bootstrap "gui/$UID" "$cleanup_plist" >/dev/null 2>&1 || true
+  launchctl kickstart "gui/$UID/$cleanup_label" >/dev/null 2>&1 || true
+}
+
+state_is_available() {
+  [[ -f "$STATE_FILE" && "$(<"$STATE_FILE")" == available* ]]
+}
+
+dialog_agent_notify() {
+  local title="$1"
+  local message="$2"
+  local status_output dialog_state method_rc
+  local escaped_label escaped_title escaped_message escaped_state_file escaped_plist escaped_seconds
+
+  DIALOG_AGENT_STATUS="not-run"
+  [[ "$(uname -s)" == "Darwin" ]] || return 1
+  [[ -x /usr/bin/osascript ]] || return 1
+
+  mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+
+  status_output="$(launchctl print "gui/$UID/$DIALOG_LABEL" 2>/dev/null)" && {
+    dialog_state="$(print -r -- "$status_output" | awk -F'= ' '/state =/ {print $2; exit}')"
+    if [[ "$DIALOG_DEDUP" != "0" && "$dialog_state" == "running" ]]; then
+      print -r -- "already_visible	$(date '+%Y-%m-%d %H:%M:%S %z')	$title	$message" > "$DIALOG_STATE_FILE"
+      DIALOG_AGENT_STATUS="already-visible"
+      return 0
+    fi
+    launchctl bootout "gui/$UID/$DIALOG_LABEL" >/dev/null 2>&1 || true
+  }
+
+  escaped_label="$(xml_escape "$DIALOG_LABEL")"
+  escaped_title="$(xml_escape "$title")"
+  escaped_message="$(xml_escape "$message")"
+  escaped_state_file="$(xml_escape "$DIALOG_STATE_FILE")"
+  escaped_plist="$(xml_escape "$DIALOG_PLIST")"
+  escaped_seconds="$(xml_escape "$NOTIFY_DIALOG_SECONDS")"
+
+  {
+    print -r -- '<?xml version="1.0" encoding="UTF-8"?>'
+    print -r -- '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    print -r -- '<plist version="1.0">'
+    print -r -- '<dict>'
+    print -r -- '  <key>Label</key>'
+    print -r -- "  <string>$escaped_label</string>"
+    print -r -- '  <key>ProgramArguments</key>'
+    print -r -- '  <array>'
+    print -r -- '    <string>/bin/zsh</string>'
+    print -r -- '    <string>-c</string>'
+    print -r -- '    <string>title="$1"; message="$2"; seconds="$3"; state_file="$4"; plist="$5"; mkdir -p "$(dirname "$state_file")" 2&gt;/dev/null || true; print -r -- "running	$(date &apos;+%Y-%m-%d %H:%M:%S %z&apos;)	$title	$message" &gt; "$state_file"; if [[ "$seconds" == &lt;-&gt; &amp;&amp; "$seconds" -gt 0 ]]; then /usr/bin/osascript -e &apos;on run argv&apos; -e &apos;display dialog (item 2 of argv) with title (item 1 of argv) buttons {"OK"} default button "OK" giving up after ((item 3 of argv) as integer)&apos; -e &apos;end run&apos; "$title" "$message" "$seconds"; else /usr/bin/osascript -e &apos;on run argv&apos; -e &apos;display dialog (item 2 of argv) with title (item 1 of argv) buttons {"OK"} default button "OK"&apos; -e &apos;end run&apos; "$title" "$message"; fi; rc=$?; print -r -- "closed	$(date &apos;+%Y-%m-%d %H:%M:%S %z&apos;)	rc=$rc	$title	$message" &gt; "$state_file"; rm -f "$plist"; exit "$rc"</string>'
+    print -r -- '    <string>_</string>'
+    print -r -- "    <string>$escaped_title</string>"
+    print -r -- "    <string>$escaped_message</string>"
+    print -r -- "    <string>$escaped_seconds</string>"
+    print -r -- "    <string>$escaped_state_file</string>"
+    print -r -- "    <string>$escaped_plist</string>"
+    print -r -- '  </array>'
+    print -r -- '  <key>RunAtLoad</key>'
+    print -r -- '  <true/>'
+    print -r -- '</dict>'
+    print -r -- '</plist>'
+  } > "$DIALOG_PLIST"
+  chmod 644 "$DIALOG_PLIST"
+
+  launchctl bootstrap "gui/$UID" "$DIALOG_PLIST" >/dev/null 2>&1
+  method_rc=$?
+  if [[ "$method_rc" == "0" ]]; then
+    print -r -- "launched	$(date '+%Y-%m-%d %H:%M:%S %z')	$title	$message" > "$DIALOG_STATE_FILE"
+    DIALOG_AGENT_STATUS="launched"
+  else
+    DIALOG_AGENT_STATUS="bootstrap-$method_rc"
+  fi
+  return "$method_rc"
 }
 
 notify() {
@@ -264,23 +388,10 @@ notify() {
   fi
 
   if [[ "$NOTIFY_METHOD" == "dialog" || "$NOTIFY_METHOD" == "all" ]]; then
-    if [[ -x /usr/bin/osascript ]]; then
-      if [[ "$NOTIFY_DIALOG_SECONDS" == <-> && "$NOTIFY_DIALOG_SECONDS" -gt 0 ]]; then
-        /usr/bin/osascript \
-          -e 'on run argv' \
-          -e 'display dialog (item 2 of argv) with title (item 1 of argv) buttons {"OK"} default button "OK" giving up after ((item 3 of argv) as integer)' \
-          -e 'end run' \
-          "$title" "$message" "$NOTIFY_DIALOG_SECONDS" >/dev/null 2>&1 &
-      else
-        /usr/bin/osascript \
-          -e 'on run argv' \
-          -e 'display dialog (item 2 of argv) with title (item 1 of argv) buttons {"OK"} default button "OK"' \
-          -e 'end run' \
-          "$title" "$message" >/dev/null 2>&1 &
-      fi
-      attempts+=("dialog:background")
-      sent=0
-    fi
+    dialog_agent_notify "$title" "$message"
+    method_rc=$?
+    attempts+=("dialog-agent:${DIALOG_AGENT_STATUS:-$method_rc}")
+    [[ "$method_rc" == "0" ]] && sent=0
   fi
 
   if [[ "$NOTIFY_METHOD" == "auto" || "$NOTIFY_METHOD" == "sound" || "$NOTIFY_METHOD" == "all" ]]; then
@@ -553,10 +664,6 @@ run_probe() {
       notify "Codex Probe" "AnyRouter Codex/GPT 可用：$available_join"
     fi
     [[ "$QUIET" == "1" ]] || print -r -- "Summary: available via $available_join"
-    if [[ "$STOP_ON_AVAILABLE" == "1" ]]; then
-      self_stop_agent
-      [[ "$QUIET" == "1" ]] || print -r -- "Stopped launchd probe after availability."
-    fi
   else
     print -r -- "unavailable	$timestamp	rate_limited=$rate_limited_join	failed=$failed_join" > "$STATE_FILE"
     [[ "$QUIET" == "1" ]] || print -r -- "Summary: unavailable. rate_limited=[$rate_limited_join] failed=[$failed_join]"
@@ -566,7 +673,7 @@ run_probe() {
 write_plist() {
   local interval_seconds="$1"
   local escaped_label escaped_script escaped_workdir escaped_stdout escaped_stderr escaped_path escaped_api_key_file
-  local escaped_log_dir escaped_log_file escaped_state_file escaped_loop_state_file
+  local escaped_home escaped_log_dir escaped_log_file escaped_state_file escaped_loop_state_file escaped_dialog_label escaped_dialog_state_file
 
   mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
   escaped_label="$(xml_escape "$LABEL")"
@@ -575,11 +682,14 @@ write_plist() {
   escaped_stdout="$(xml_escape "$LOG_DIR/codex.launchd.out.log")"
   escaped_stderr="$(xml_escape "$LOG_DIR/codex.launchd.err.log")"
   escaped_path="$(xml_escape "$LAUNCHD_PATH")"
+  escaped_home="$(xml_escape "$HOME")"
   escaped_api_key_file="$(xml_escape "$API_KEY_FILE")"
   escaped_log_dir="$(xml_escape "$LOG_DIR")"
   escaped_log_file="$(xml_escape "$LOG_FILE")"
   escaped_state_file="$(xml_escape "$STATE_FILE")"
   escaped_loop_state_file="$(xml_escape "$LOOP_STATE_FILE")"
+  escaped_dialog_label="$(xml_escape "$DIALOG_LABEL")"
+  escaped_dialog_state_file="$(xml_escape "$DIALOG_STATE_FILE")"
   local plist_model plist_base_url plist_codex_bin
   plist_model="${MODEL:-$(codex_config_value model)}"
   plist_base_url="${BASE_URL:-$(codex_config_value base_url)}"
@@ -599,7 +709,11 @@ write_plist() {
     print -r -- '    <string>loop</string>'
     print -r -- '    <string>--interval</string>'
     print -r -- "    <string>$interval_seconds</string>"
-    print -r -- '    <string>--notify</string>'
+    if [[ "$NOTIFY" == "1" ]]; then
+      print -r -- '    <string>--notify</string>'
+    else
+      print -r -- '    <string>--no-notify</string>'
+    fi
     print -r -- '    <string>--quiet</string>'
     print -r -- '    <string>--notify-mode</string>'
     print -r -- "    <string>$(xml_escape "$NOTIFY_MODE")</string>"
@@ -630,6 +744,8 @@ write_plist() {
     print -r -- '  <dict>'
     print -r -- '    <key>PATH</key>'
     print -r -- "    <string>$escaped_path</string>"
+    print -r -- '    <key>HOME</key>'
+    print -r -- "    <string>$escaped_home</string>"
     print -r -- '    <key>ANYROUTER_LOG_DIR</key>'
     print -r -- "    <string>$escaped_log_dir</string>"
     print -r -- '    <key>ANYROUTER_CODEX_LOG_FILE</key>'
@@ -638,6 +754,12 @@ write_plist() {
     print -r -- "    <string>$escaped_state_file</string>"
     print -r -- '    <key>ANYROUTER_CODEX_LOOP_STATE_FILE</key>'
     print -r -- "    <string>$escaped_loop_state_file</string>"
+    print -r -- '    <key>ANYROUTER_CODEX_LABEL</key>'
+    print -r -- "    <string>$escaped_label</string>"
+    print -r -- '    <key>ANYROUTER_DIALOG_LABEL</key>'
+    print -r -- "    <string>$escaped_dialog_label</string>"
+    print -r -- '    <key>ANYROUTER_DIALOG_STATE_FILE</key>'
+    print -r -- "    <string>$escaped_dialog_state_file</string>"
     if [[ "$INHERIT_PROXY" == "1" ]]; then
       local proxy_name proxy_value
       for proxy_name in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
@@ -676,9 +798,10 @@ loop_agent() {
     print -r -- "running	$(date '+%Y-%m-%d %H:%M:%S %z')	interval=${interval_seconds}s" > "$LOOP_STATE_FILE"
     run_probe || true
 
-    if [[ "$STOP_ON_AVAILABLE" == "1" && -f "$STATE_FILE" && "$(<"$STATE_FILE")" == available* ]]; then
+    if [[ "$STOP_ON_AVAILABLE" == "1" && state_is_available ]]; then
       print -r -- "stopped_available	$(date '+%Y-%m-%d %H:%M:%S %z')	interval=${interval_seconds}s" > "$LOOP_STATE_FILE"
-      return 0
+      schedule_self_stop_agent
+      exit 0
     fi
 
     ended="$(date +%s)"
@@ -723,6 +846,8 @@ stop_agent() {
   [[ "$(uname -s)" == "Darwin" ]] || { print -u2 -r -- "launchd is only supported on macOS."; return 2; }
   launchctl bootout "gui/$UID" "$PLIST" >/dev/null 2>&1 || true
   rm -f "$PLIST"
+  mkdir -p "$LOG_DIR"
+  print -r -- "stopped_manual	$(date '+%Y-%m-%d %H:%M:%S %z')" > "$LOOP_STATE_FILE"
   print -r -- "Stopped Codex probe: $LABEL"
 }
 
@@ -775,6 +900,9 @@ health_agent() {
   if [[ -f "$LOOP_STATE_FILE" ]]; then
     loop_state="$(tail -n 1 "$LOOP_STATE_FILE")"
   fi
+  if [[ "$loaded" != "yes" && "$loop_state" == running* && state_is_available ]]; then
+    loop_state="stopped_available	$(date '+%Y-%m-%d %H:%M:%S %z')	inferred_from_available_state"
+  fi
   [[ -n "$interval" ]] || interval="unknown"
   if [[ "$interval" == <-> ]]; then
     interval_label="${interval}s"
@@ -799,6 +927,13 @@ health_agent() {
 case "$COMMAND" in
   once)
     run_probe
+    probe_rc=$?
+    if [[ "$probe_rc" == "0" && "$STOP_ON_AVAILABLE" == "1" && state_is_available ]]; then
+      print -r -- "stopped_available	$(date '+%Y-%m-%d %H:%M:%S %z')	interval=once" > "$LOOP_STATE_FILE"
+      [[ "$QUIET" == "1" ]] || print -r -- "Stopped launchd probe after availability."
+      schedule_self_stop_agent
+    fi
+    exit "$probe_rc"
     ;;
   loop)
     loop_agent

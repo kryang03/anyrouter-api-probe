@@ -67,7 +67,11 @@ chmod +x probe_claude_code.zsh probe_codex.zsh
 ./probe_codex.zsh start -i 15m --notify-mode on-change
 ```
 
-通知通道默认是 `dialog`：成功时弹出一个不会自动消失的可见对话框。`auto` 会优先使用 `terminal-notifier` 投递到 macOS 通知中心，再尝试 VS Code/`osascript`，同时播放系统声音和 terminal bell。若只能听到声音但看不到横幅，请在系统设置里检查 `Terminal Notifier` 的通知样式是否允许横幅或提醒；不是只检查 VS Code。
+通知通道默认是 `dialog`：成功时启动一个独立的 dialog LaunchAgent，弹出不会自动消失的可见对话框。即使 probe/loop 在 `available` 后自动停止，这个 dialog 也会一直留到你亲手点 OK。
+
+默认只允许一个 dialog 同时存在。如果你没看屏幕，第一次 dialog 会一直停留；后续再次触发 available 时不会继续叠第二个窗口，只会记录为 `already_visible`。
+
+`auto` 会优先使用 `terminal-notifier` 投递到 macOS 通知中心，再尝试 VS Code/`osascript`，同时播放系统声音和 terminal bell。若只能听到声音但看不到横幅，请在系统设置里检查 `Terminal Notifier` 的通知样式是否允许横幅或提醒；不是只检查 VS Code。
 
 如果通知横幅仍被 macOS 吞掉，可以改用可见弹窗。`dialog` 默认不会自动消失，会一直停留到你点 OK：
 
@@ -81,7 +85,7 @@ ANYROUTER_NOTIFY_METHOD=dialog ./probe_codex.zsh test-notification
 ./probe_claude_code.zsh start -i 15m --notify-method dialog
 ```
 
-若希望 `dialog` 自动消失，可以设置秒数：
+若明确希望 `dialog` 自动消失，可以设置秒数；默认不要设置它：
 
 ```zsh
 ANYROUTER_NOTIFY_DIALOG_SECONDS=30 ./probe_codex.zsh start -i 15m --notify-method dialog
