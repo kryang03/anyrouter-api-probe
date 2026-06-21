@@ -35,16 +35,14 @@ chmod +x probe_claude_code.zsh probe_codex.zsh
 
 默认 15 分钟。默认启动模式是 `stop-on-available`：后台定时探测，一旦状态变为 `available`，脚本会自动执行 `stop`，移除对应的 launchd 定时任务，避免继续消耗请求额度。
 
+间隔按“每轮 probe 的开始时间”计算。例如 `-i 15m` 表示尽量每隔 15 分钟启动一轮探测；如果一轮 probe 自己跑了 4 分钟，下一轮只会再等约 11 分钟，而不是等这一轮结束后再重新等待 15 分钟。
+
 ```zsh
 ./probe_claude_code.zsh start
 ./probe_codex.zsh start
 ```
-行为是：
-1.重新写入 Claude 探针的 plist。
-2.执行 launchctl bootout "gui/$UID" "$PLIST"，卸载已有的同名任务。
-3.再 bootstrap 加载新任务。
-4.立即 kickstart 触发一次探测。
-所以它相当于“重启并替换 Claude 探针配置”
+
+`start` 会重写对应探针的 plist，并替换已有的同名后台任务。Claude 和 Codex 使用不同 label，互不影响。
 
 自由选择间隔：
 
@@ -105,7 +103,9 @@ ANYROUTER_NOTIFY_DIALOG_SECONDS=30 ./probe_codex.zsh start -i 15m --notify-metho
 - `loaded=yes`: launchd 已加载，后台定时仍有效。
 - `Mode`: `stop-on-available` 表示可用后自动停止；`always` 表示持续轮询。
 - `Interval`: 定时间隔秒数，例如 `1800s` 是 30 分钟。
-- `last_exit=0`: 上一次脚本正常结束。
+- `Launchd process`: 后台 loop 进程；新调度器下通常会一直存在。
+- `Loop state`: `running` 表示正在 probe，`sleeping` 表示等到下一轮开始，`behind` 表示上一轮已经超过间隔，会立刻进入下一轮。
+- `last_exit=0`: launchd 上一次退出码；loop 正常运行时通常不会频繁变化。
 - `Last result`: 最近一次实际探测结果。
 
 在默认 `stop-on-available` 模式下，如果 `Last result` 已经是 `available`，随后看到 `loaded=no` 或 plist 消失，通常表示探针已经按规则自动停止。若你需要它一直留在后台，请重新用 `--always` 启动：
@@ -126,7 +126,7 @@ ANYROUTER_NOTIFY_DIALOG_SECONDS=30 ./probe_codex.zsh start -i 15m --notify-metho
 ./probe_codex.zsh stop
 ```
 
-`launchd` 不是常驻循环进程，而是按间隔唤醒脚本执行一次；所以 `status` 在两次探测之间显示 `state = not running` 是正常的。只要 plist 仍在 `~/Library/LaunchAgents/`，并且 `run interval` 是你设置的秒数，就会继续后台定时运行。
+当前版本由 `launchd` 启动一个轻量 loop 进程，loop 内部负责按“开始到开始”的间隔调度 probe。因此正常后台运行时通常会看到 `state = running`；如果 `loaded=yes` 但长期 `state = not running`，说明可能仍是旧 plist 或任务已经异常退出，建议重新执行一次 `start`。
 
 `status` 会输出完整 launchd 详情，通常只在排查问题时使用；日常确认用 `health` 更快。
 

@@ -7,6 +7,7 @@ API_KEY_FILE="${ANYROUTER_API_KEY_FILE:-$SCRIPT_DIR/API_KEY}"
 LOG_DIR="${ANYROUTER_LOG_DIR:-$SCRIPT_DIR/logs}"
 LOG_FILE="${ANYROUTER_CODEX_LOG_FILE:-$LOG_DIR/codex.tsv}"
 STATE_FILE="${ANYROUTER_CODEX_STATE_FILE:-$LOG_DIR/codex.state}"
+LOOP_STATE_FILE="${ANYROUTER_CODEX_LOOP_STATE_FILE:-$LOG_DIR/codex.loop.state}"
 LABEL="${ANYROUTER_CODEX_LABEL:-com.yang.anyrouter-probe.codex}"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
@@ -168,6 +169,25 @@ xml_escape() {
     -e 's/>/\&gt;/g' \
     -e 's/"/\&quot;/g' \
     -e "s/'/\&apos;/g" <<< "$1"
+}
+
+plist_arg_after() {
+  local option="$1"
+  [[ -f "$PLIST" ]] || return 0
+
+  plutil -extract ProgramArguments xml1 -o - "$PLIST" 2>/dev/null | awk -v opt="$option" '
+    found && /<string>/ {
+      gsub(/^.*<string>/, "", $0)
+      gsub(/<\/string>.*$/, "", $0)
+      print
+      exit
+    }
+    $0 ~ "<string>" opt "</string>" { found = 1 }
+  '
+}
+
+format_epoch() {
+  date -r "$1" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S %z'
 }
 
 self_stop_agent() {
@@ -546,6 +566,7 @@ run_probe() {
 write_plist() {
   local interval_seconds="$1"
   local escaped_label escaped_script escaped_workdir escaped_stdout escaped_stderr escaped_path escaped_api_key_file
+  local escaped_log_dir escaped_log_file escaped_state_file escaped_loop_state_file
 
   mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
   escaped_label="$(xml_escape "$LABEL")"
@@ -555,6 +576,10 @@ write_plist() {
   escaped_stderr="$(xml_escape "$LOG_DIR/codex.launchd.err.log")"
   escaped_path="$(xml_escape "$LAUNCHD_PATH")"
   escaped_api_key_file="$(xml_escape "$API_KEY_FILE")"
+  escaped_log_dir="$(xml_escape "$LOG_DIR")"
+  escaped_log_file="$(xml_escape "$LOG_FILE")"
+  escaped_state_file="$(xml_escape "$STATE_FILE")"
+  escaped_loop_state_file="$(xml_escape "$LOOP_STATE_FILE")"
   local plist_model plist_base_url plist_codex_bin
   plist_model="${MODEL:-$(codex_config_value model)}"
   plist_base_url="${BASE_URL:-$(codex_config_value base_url)}"
@@ -571,7 +596,9 @@ write_plist() {
     print -r -- '  <array>'
     print -r -- '    <string>/bin/zsh</string>'
     print -r -- "    <string>$escaped_script</string>"
-    print -r -- '    <string>once</string>'
+    print -r -- '    <string>loop</string>'
+    print -r -- '    <string>--interval</string>'
+    print -r -- "    <string>$interval_seconds</string>"
     print -r -- '    <string>--notify</string>'
     print -r -- '    <string>--quiet</string>'
     print -r -- '    <string>--notify-mode</string>'
@@ -603,6 +630,14 @@ write_plist() {
     print -r -- '  <dict>'
     print -r -- '    <key>PATH</key>'
     print -r -- "    <string>$escaped_path</string>"
+    print -r -- '    <key>ANYROUTER_LOG_DIR</key>'
+    print -r -- "    <string>$escaped_log_dir</string>"
+    print -r -- '    <key>ANYROUTER_CODEX_LOG_FILE</key>'
+    print -r -- "    <string>$escaped_log_file</string>"
+    print -r -- '    <key>ANYROUTER_CODEX_STATE_FILE</key>'
+    print -r -- "    <string>$escaped_state_file</string>"
+    print -r -- '    <key>ANYROUTER_CODEX_LOOP_STATE_FILE</key>'
+    print -r -- "    <string>$escaped_loop_state_file</string>"
     if [[ "$INHERIT_PROXY" == "1" ]]; then
       local proxy_name proxy_value
       for proxy_name in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
@@ -618,8 +653,6 @@ write_plist() {
       done
     fi
     print -r -- '  </dict>'
-    print -r -- '  <key>StartInterval</key>'
-    print -r -- "  <integer>$interval_seconds</integer>"
     print -r -- '  <key>RunAtLoad</key>'
     print -r -- '  <true/>'
     print -r -- '  <key>StandardOutPath</key>'
@@ -633,6 +666,35 @@ write_plist() {
   chmod 644 "$PLIST"
 }
 
+loop_agent() {
+  local interval_seconds started ended next_start sleep_seconds loop_status next_start_text
+  interval_seconds="$(parse_interval "$INTERVAL_RAW")" || return $?
+  mkdir -p "$LOG_DIR"
+
+  while true; do
+    started="$(date +%s)"
+    print -r -- "running	$(date '+%Y-%m-%d %H:%M:%S %z')	interval=${interval_seconds}s" > "$LOOP_STATE_FILE"
+    run_probe || true
+
+    if [[ "$STOP_ON_AVAILABLE" == "1" && -f "$STATE_FILE" && "$(<"$STATE_FILE")" == available* ]]; then
+      print -r -- "stopped_available	$(date '+%Y-%m-%d %H:%M:%S %z')	interval=${interval_seconds}s" > "$LOOP_STATE_FILE"
+      return 0
+    fi
+
+    ended="$(date +%s)"
+    next_start="$(( started + interval_seconds ))"
+    sleep_seconds="$(( next_start - ended ))"
+    if (( sleep_seconds > 0 )); then
+      next_start_text="$(format_epoch "$next_start")"
+      print -r -- "sleeping	$(date '+%Y-%m-%d %H:%M:%S %z')	next_start=$next_start_text	sleep=${sleep_seconds}s	interval=${interval_seconds}s" > "$LOOP_STATE_FILE"
+      sleep "$sleep_seconds"
+    else
+      loop_status="$(( -sleep_seconds ))"
+      print -r -- "behind	$(date '+%Y-%m-%d %H:%M:%S %z')	lag=${loop_status}s	interval=${interval_seconds}s" > "$LOOP_STATE_FILE"
+    fi
+  done
+}
+
 start_agent() {
   [[ "$(uname -s)" == "Darwin" ]] || { print -u2 -r -- "launchd is only supported on macOS."; return 2; }
   local interval_seconds
@@ -644,7 +706,7 @@ start_agent() {
   write_plist "$interval_seconds"
   launchctl bootout "gui/$UID" "$PLIST" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$UID" "$PLIST"
-  launchctl kickstart -k "gui/$UID/$LABEL" >/dev/null 2>&1 || true
+  launchctl kickstart "gui/$UID/$LABEL" >/dev/null 2>&1 || true
 
   print -r -- "Started Codex probe: $LABEL"
   if [[ "$STOP_ON_AVAILABLE" == "1" ]]; then
@@ -653,6 +715,7 @@ start_agent() {
     print -r -- "Mode: always"
   fi
   print -r -- "Interval: ${interval_seconds}s"
+  print -r -- "Schedule: start-to-start"
   print -r -- "Log: $LOG_FILE"
 }
 
@@ -671,8 +734,9 @@ status_agent() {
 health_agent() {
   [[ "$(uname -s)" == "Darwin" ]] || { print -u2 -r -- "launchd is only supported on macOS."; return 2; }
 
-  local loaded="no" state="not loaded" interval="unknown" mode="unknown" last_exit="unknown" runs="unknown" last_result="no log yet"
-  local status_output plist_interval log_line
+  local loaded="no" state="not loaded" interval="unknown" interval_label="unknown" mode="unknown" last_exit="unknown" runs="unknown" last_result="no log yet"
+  local current_pid="" current_elapsed="unknown" current_reason="unknown"
+  local status_output plist_interval log_line loop_state="no loop state yet"
 
   status_output="$(launchctl print "gui/$UID/$LABEL" 2>/dev/null)" && loaded="yes"
   if [[ "$loaded" == "yes" ]]; then
@@ -680,12 +744,21 @@ health_agent() {
     interval="$(print -r -- "$status_output" | awk '/run interval =/ {print $4; exit}')"
     last_exit="$(print -r -- "$status_output" | awk -F'= ' '/last exit code =/ {print $2; exit}')"
     runs="$(print -r -- "$status_output" | awk -F'= ' '/runs =/ {print $2; exit}')"
+    current_pid="$(print -r -- "$status_output" | awk -F'= ' '/pid =/ {print $2; exit}')"
+    current_reason="$(print -r -- "$status_output" | awk -F'= ' '/immediate reason =/ {print $2; exit}')"
+    if [[ -n "$current_pid" ]]; then
+      current_elapsed="$(ps -p "$current_pid" -o etime= 2>/dev/null | awk '{$1=$1; print}')"
+      [[ -n "$current_elapsed" ]] || current_elapsed="unknown"
+    fi
   elif [[ -f "$PLIST" ]]; then
     loaded="plist-only"
-    plist_interval="$(plutil -extract StartInterval raw -o - "$PLIST" 2>/dev/null || true)"
-    [[ -n "$plist_interval" ]] && interval="$plist_interval"
   fi
   if [[ -f "$PLIST" ]]; then
+    plist_interval="$(plist_arg_after --interval)"
+    if [[ -z "$plist_interval" ]]; then
+      plist_interval="$(plutil -extract StartInterval raw -o - "$PLIST" 2>/dev/null || true)"
+    fi
+    [[ -n "$plist_interval" && ( -z "$interval" || "$interval" == "unknown" ) ]] && interval="$plist_interval"
     if plutil -extract ProgramArguments xml1 -o - "$PLIST" 2>/dev/null | grep -q -- '--stop-on-available'; then
       mode="stop-on-available"
     else
@@ -699,20 +772,36 @@ health_agent() {
       last_result="$(print -r -- "$log_line" | awk -F'\t' '{printf "%s %s %s %s %ss", $1, $2, $3, $5, $6}')"
     fi
   fi
+  if [[ -f "$LOOP_STATE_FILE" ]]; then
+    loop_state="$(tail -n 1 "$LOOP_STATE_FILE")"
+  fi
+  [[ -n "$interval" ]] || interval="unknown"
+  if [[ "$interval" == <-> ]]; then
+    interval_label="${interval}s"
+  else
+    interval_label="$interval"
+  fi
 
   print -r -- "Codex probe: loaded=$loaded state=$state"
   print -r -- "Mode: $mode"
-  print -r -- "Interval: ${interval}s  runs=$runs  last_exit=$last_exit"
+  print -r -- "Interval: $interval_label  launchd_runs=$runs  last_exit=$last_exit"
+  if [[ "$state" == "running" && -n "$current_pid" ]]; then
+    print -r -- "Launchd process: pid=$current_pid elapsed=$current_elapsed reason=$current_reason"
+  fi
+  print -r -- "Loop state: $loop_state"
   print -r -- "Last result: $last_result"
   print -r -- "Log: $LOG_FILE"
   if [[ "$state" == "not running" ]]; then
-    print -r -- "Note: not running is normal between launchd intervals."
+    print -r -- "Note: with the new loop scheduler, loaded=yes should usually stay running."
   fi
 }
 
 case "$COMMAND" in
   once)
     run_probe
+    ;;
+  loop)
+    loop_agent
     ;;
   start)
     start_agent
