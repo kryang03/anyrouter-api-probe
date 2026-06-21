@@ -165,3 +165,42 @@ Codex 默认使用 `gpt-5.5`，并调用本机 `codex exec`，这和实际聊天
 - `network_error` / `claude_cli_error` / `codex_cli_error`: 网络、代理、CLI 或请求链路异常。
 
 探针请求尽量使用最短提示词 `hi`，但仍会消耗 API 请求额度。
+
+## 账号填入方式
+两个脚本都是从同目录的 `API_KEY` 里读账号，默认路径是：
+
+```zsh
+./API_KEY
+```
+
+也可以用 `--api-key-file PATH` 或 `ANYROUTER_API_KEY_FILE=...` 覆盖。
+
+Claude 探针读取逻辑在 [probe_claude_code.zsh](./probe_claude_code.zsh:310)：它扫描 `API_KEY` 里所有形如：
+
+```zsh
+export ANTHROPIC_AUTH_TOKEN=...
+```
+
+的行，把每一行作为一个账号。如果没有找到 `ANTHROPIC_AUTH_TOKEN`，才会退而扫描：
+
+```zsh
+export ANTHROPIC_API_KEY=...
+```
+
+然后按文件顺序编号：第一个是 `account-1`，第二个是 `account-2`。执行时在 [probe_claude_code.zsh](./probe_claude_code.zsh:528) 逐个测试：`account-1` 不可用或超时会继续测 `account-2`；如果某个账号 `available`，默认就停止后续账号测试以省额度，除非加 `--all-accounts`。
+
+Codex 探针读取逻辑在 [probe_codex.zsh](./probe_codex.zsh:318)：它扫描 `API_KEY` 里所有：
+
+```zsh
+export OPENAI_API_KEY=...
+```
+
+也兼容 JSON 片段里的：
+
+```json
+"OPENAI_API_KEY": "..."
+```
+
+同样按出现顺序编号成 `account-1`、`account-2`，然后在 [probe_codex.zsh](./probe_codex.zsh:499) 顺序测试。
+
+脚本不会把真实 key 写进日志，日志里只记录 `account-1` / `account-2`、状态、耗时和简短错误信息。Claude 的 `~/.claude/settings.json` 和 Codex 的 `~/.codex/config.toml` 主要用于模型/配置参考，不是多账号来源；多账号来源就是这个 `API_KEY` 文件。
