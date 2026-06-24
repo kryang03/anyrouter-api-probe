@@ -17,13 +17,6 @@ chmod +x probe_claude_code.zsh probe_codex.zsh
 ./probe_codex.zsh once
 ```
 
-`once` 默认会在可用时弹出 `dialog` 提醒。若只想看终端输出：
-
-```zsh
-./probe_claude_code.zsh once --no-notify
-./probe_codex.zsh once --no-notify
-```
-
 测试通知：
 
 ```zsh
@@ -37,12 +30,18 @@ chmod +x probe_claude_code.zsh probe_codex.zsh
 
 间隔按“每轮 probe 的开始时间”计算。例如 `-i 15m` 表示尽量每隔 15 分钟启动一轮探测；如果一轮 probe 自己跑了 4 分钟，下一轮只会再等约 11 分钟，而不是等这一轮结束后再重新等待 15 分钟。
 
+首先确认vpn，能连接到 anyrouter
 ```zsh
 ./probe_claude_code.zsh start
-./probe_codex.zsh start
+./probe_codex.zsh start -i 5m
 ```
 
 `start` 会重写对应探针的 plist，并替换已有的同名后台任务。Claude 和 Codex 使用不同 label，互不影响。
+
+```zsh
+./probe_claude_code.zsh stop
+./probe_codex.zsh stop
+```
 
 自由选择间隔：
 

@@ -890,7 +890,7 @@ loop_agent() {
     print -r -- "running	$(date '+%Y-%m-%d %H:%M:%S %z')	interval=${interval_seconds}s" > "$LOOP_STATE_FILE"
     run_probe || true
 
-    if [[ "$STOP_ON_AVAILABLE" == "1" && state_is_available ]]; then
+    if [[ "$STOP_ON_AVAILABLE" == "1" ]] && state_is_available; then
       print -r -- "stopped_available	$(date '+%Y-%m-%d %H:%M:%S %z')	interval=${interval_seconds}s" > "$LOOP_STATE_FILE"
       schedule_self_stop_agent
       exit 0
@@ -992,7 +992,10 @@ health_agent() {
   if [[ -f "$LOOP_STATE_FILE" ]]; then
     loop_state="$(tail -n 1 "$LOOP_STATE_FILE")"
   fi
-  if [[ "$loaded" != "yes" && "$loop_state" == running* && state_is_available ]]; then
+  if [[ "$loop_state" == stopped_available* ]] && ! state_is_available; then
+    loop_state="stopped_unavailable	$(date '+%Y-%m-%d %H:%M:%S %z')	corrected_stale_stopped_available"
+  fi
+  if [[ "$loaded" != "yes" && "$loop_state" == running* ]] && state_is_available; then
     loop_state="stopped_available	$(date '+%Y-%m-%d %H:%M:%S %z')	inferred_from_available_state"
   fi
   [[ -n "$interval" ]] || interval="unknown"
@@ -1020,7 +1023,7 @@ case "$COMMAND" in
   once)
     run_probe
     probe_rc=$?
-    if [[ "$probe_rc" == "0" && "$STOP_ON_AVAILABLE" == "1" && state_is_available ]]; then
+    if [[ "$probe_rc" == "0" && "$STOP_ON_AVAILABLE" == "1" ]] && state_is_available; then
       print -r -- "stopped_available	$(date '+%Y-%m-%d %H:%M:%S %z')	interval=once" > "$LOOP_STATE_FILE"
       [[ "$QUIET" == "1" ]] || print -r -- "Stopped launchd probe after availability."
       schedule_self_stop_agent
